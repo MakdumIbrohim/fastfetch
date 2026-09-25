@@ -8,6 +8,7 @@
 #include "detection/os/os.h"
 #include "detection/terminalshell/terminalshell.h"
 
+#include <stdio.h>
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
@@ -450,6 +451,88 @@ static bool logoPrintData(bool doColorReplacement, FFstrbuf* source) {
     return true;
 }
 
+static inline uint64_t logoHashUrl(const char* str) {
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    while (*str) {
+        hash ^= (uint64_t) (unsigned char) (*str++);
+        hash *= 0x100000001b3ULL;
+    }
+    return hash;
+}
+
+static void logoGetUrlExtension(const char* url, FFstrbuf* ext) {
+    const char* queryOrFrag = strpbrk(url, "?#");
+    const char* pathEnd = queryOrFrag ? queryOrFrag : url + strlen(url);
+    const char* dot = nullptr;
+    for (const char* p = pathEnd - 1; p >= url; --p) {
+        if (*p == '/') break;
+        if (*p == '.') {
+            dot = p;
+            break;
+        }
+    }
+    if (dot && (pathEnd - dot) <= 8 && (pathEnd - dot) > 1) {
+        ffStrbufAppendNS(ext, (uint32_t) (pathEnd - dot), dot);
+    }
+}
+
+static bool logoFetchRemote(FFOptionsLogo* options) {
+    FF_STRBUF_AUTO_DESTROY cachePath = ffStrbufCreateCopy(&instance.state.platform.cacheDir);
+    ffStrbufEnsureEndsWithC(&cachePath, '/');
+    ffStrbufAppendS(&cachePath, "fastfetch/remote_logos/");
+    uint64_t hash = logoHashUrl(options->source.chars);
+    ffStrbufAppendF(&cachePath, "%016llx", (unsigned long long) hash);
+    logoGetUrlExtension(options->source.chars, &cachePath);
+
+    if (options->cache == FF_LOGO_CACHE_ON && ffPathExists(cachePath.chars, FF_PATHTYPE_FILE)) {
+        ffStrbufDestroy(&options->source);
+        ffStrbufInitMove(&options->source, &cachePath);
+        return true;
+    }
+
+    FF_STRBUF_AUTO_DESTROY tempPath = ffStrbufCreateCopy(&cachePath);
+    ffStrbufAppendS(&tempPath, ".tmp");
+
+    char* const argv[] = {
+        "curl",
+        "-sLf",
+        "--create-dirs",
+        "-o",
+        tempPath.chars,
+        options->source.chars,
+        nullptr
+    };
+
+    FFProcessHandle handle;
+    const char* error = ffProcessSpawn(argv, false, ffGetNullFD(), &handle);
+    if (error != nullptr) {
+        if (instance.config.display.showErrors) {
+            fprintf(stderr, "Logo: failed to run curl to download logo: %s\n", error);
+        }
+        return false;
+    }
+
+    FF_STRBUF_AUTO_DESTROY dummyBuf = ffStrbufCreate();
+    ffProcessReadOutput(&handle, &dummyBuf);
+
+    if (!ffPathExists(tempPath.chars, FF_PATHTYPE_FILE)) {
+        if (instance.config.display.showErrors) {
+            fprintf(stderr, "Logo: failed to download remote logo from: %s\n", options->source.chars);
+        }
+        return false;
+    }
+
+    ffRemoveFile(cachePath.chars);
+    if (rename(tempPath.chars, cachePath.chars) != 0) {
+        ffRemoveFile(tempPath.chars);
+        return false;
+    }
+
+    ffStrbufDestroy(&options->source);
+    ffStrbufInitMove(&options->source, &cachePath);
+    return true;
+}
+
 static bool updateLogoPath(void) {
     FFOptionsLogo* options = &instance.config.logo;
 
@@ -459,6 +542,10 @@ static bool updateLogoPath(void) {
 
     if (ffStrbufEqualS(&options->source, "-")) { // stdin
         return true;
+    }
+
+    if (ffStrStartsWith(options->source.chars, "http://") || ffStrStartsWith(options->source.chars, "https://")) {
+        return logoFetchRemote(options);
     }
 
 #if !FF_MODULE_DISABLE_MEDIA
